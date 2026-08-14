@@ -1,7 +1,9 @@
 # Agnostic Agent Memory
 
-Add durable, repository-local memory and shared skill conventions to any Git
-repository.
+Set up one version-controlled, repository-local project memory that Claude Code,
+Codex, and other coding agents can share and update. It also installs a dreaming
+skill you can run periodically to refresh that memory and turn recurring agent
+work into reusable skills or scripts.
 
 ## Instructions for agents
 
