@@ -5,6 +5,15 @@ Codex, and other coding agents can share and update. It also installs a dreaming
 skill you can run periodically to refresh that memory and turn recurring agent
 work into reusable skills or scripts.
 
+## Usage
+
+Tell your agent in your repo the following:
+
+```text
+Set up repository-local agent memory as described at
+https://github.com/teradyl/agnostic-agent-memory.
+```
+
 ## Instructions for agents
 
 When a user sends you this repository and names a target project:
@@ -37,13 +46,6 @@ existing policy files, the command changes only its marked sections and
 preserves unrelated content. It asks before touching conflicts. Use `py`
 instead of `python3` on Windows; use `--claude-mode include` where symlinks are
 unavailable.
-
-A user can hand off the whole task with:
-
-```text
-Set up repository-local agent memory as described at
-https://github.com/teradyl/agnostic-agent-memory.
-```
 
 ## Result
 
