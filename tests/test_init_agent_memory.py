@@ -12,6 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "bin" / "init-agent-memory"
+DREAMING_SKILL = ROOT / "templates" / "skills" / "dreaming" / "SKILL.md"
 SPEC = importlib.util.spec_from_loader(
     "init_agent_memory", SourceFileLoader("init_agent_memory", str(SCRIPT))
 )
@@ -58,8 +59,15 @@ class InitAgentMemoryTests(unittest.TestCase):
             "follow the knowledge-placement order",
             (repo / "AGENTS.md").read_text(),
         )
-        self.assertFalse((repo / ".agents").exists())
-        self.assertFalse((repo / ".claude" / "skills").exists())
+        installed_skill = repo / ".agents" / "skills" / "dreaming" / "SKILL.md"
+        self.assertEqual(installed_skill.read_text(), DREAMING_SKILL.read_text())
+        if os.name == "nt":
+            self.assertFalse((repo / ".claude" / "skills").exists())
+        else:
+            self.assertEqual(
+                (repo / ".claude" / "skills").readlink(),
+                Path("../.agents/skills"),
+            )
         self.assertEqual(
             json.loads((repo / ".claude" / "settings.json").read_text()),
             {"autoMemoryEnabled": False},
@@ -72,6 +80,52 @@ class InitAgentMemoryTests(unittest.TestCase):
         repo = self.make_repo("repo with spaces")
         result = self.run_cli(repo)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dreaming_skill_can_be_explicitly_skipped(self):
+        repo = self.make_repo()
+        result = self.run_cli(repo, "--no-dreaming")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = repo / ".agents" / "agnostic-agent-memory.json"
+        self.assertEqual(json.loads(config.read_text()), {"dreaming": False})
+        self.assertFalse((repo / ".agents" / "skills").exists())
+        self.assertFalse((repo / ".claude" / "skills").exists())
+
+        second = self.run_cli(repo)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("no changes needed", second.stdout)
+
+        enabled = self.run_cli(repo, "--dreaming")
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        self.assertEqual(json.loads(config.read_text()), {"dreaming": True})
+        self.assertEqual(
+            (repo / ".agents" / "skills" / "dreaming" / "SKILL.md").read_text(),
+            DREAMING_SKILL.read_text(),
+        )
+
+    def test_opt_out_preserves_an_existing_dreaming_skill(self):
+        repo = self.make_repo()
+        skill = repo / ".agents" / "skills" / "dreaming" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("custom dreaming workflow\n")
+
+        result = self.run_cli(repo, "--no-dreaming")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(skill.read_text(), "custom dreaming workflow\n")
+
+    def test_existing_dreaming_skill_requires_confirmation(self):
+        repo = self.make_repo()
+        skill = repo / ".agents" / "skills" / "dreaming" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("custom dreaming workflow\n")
+
+        result = self.run_cli(repo)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(skill.read_text(), "custom dreaming workflow\n")
+        self.assertFalse((repo / "AGENTS.md").exists())
+
+        approved = self.run_cli(repo, "--yes")
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        self.assertEqual(skill.read_text(), DREAMING_SKILL.read_text())
 
     def test_copied_initializer_requires_its_canonical_sources(self):
         repo = self.make_repo()
@@ -173,6 +227,9 @@ class InitAgentMemoryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((repo / "CLAUDE.md").is_symlink())
         self.assertEqual((repo / "CLAUDE.md").read_text(), "@AGENTS.md\n")
+        self.assertTrue(
+            (repo / ".agents" / "skills" / "dreaming" / "SKILL.md").is_file()
+        )
         self.assertFalse((repo / ".claude" / "skills").exists())
 
     @unittest.skipIf(os.name == "nt", "symlink creation needs elevated Windows privileges")
@@ -203,6 +260,16 @@ class InitAgentMemoryTests(unittest.TestCase):
         settings.write_text("not json\n")
         result = self.run_cli(repo, "--yes")
         self.assertEqual(result.returncode, 2)
+        self.assertFalse((repo / "AGENTS.md").exists())
+
+    def test_invalid_agent_memory_config_aborts_before_writes(self):
+        repo = self.make_repo()
+        config = repo / ".agents" / "agnostic-agent-memory.json"
+        config.parent.mkdir()
+        config.write_text("not json\n")
+        result = self.run_cli(repo)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot safely read invalid JSON", result.stderr)
         self.assertFalse((repo / "AGENTS.md").exists())
 
     def test_dry_run_does_not_write(self):

@@ -19,4 +19,4 @@ Skills are procedures, not a general memory store. Do not create a skill only to
 
 ## Index
 
-- [Architecture](architecture.md): canonical sources, compatibility aliases, and portability constraints.
+- [Architecture](architecture.md): canonical sources, default skill templates, compatibility aliases, and portability constraints.

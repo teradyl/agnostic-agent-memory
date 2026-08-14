@@ -184,6 +184,67 @@ def validate_skills_directory(repo: Path) -> Path:
     return skills_dir
 
 
+def load_agent_memory_config(repo: Path) -> tuple[Path, dict]:
+    path = validate_skills_directory(repo).parent / "agnostic-agent-memory.json"
+    if path.is_symlink():
+        raise InitError(f"agent memory configuration must not be a symlink: {path}")
+    if path.exists() and path.is_dir():
+        raise InitError(f"expected a file but found a directory: {path}")
+    if not path.exists():
+        return path, {}
+    try:
+        config = json.loads(read_text(path))
+    except json.JSONDecodeError as exc:
+        raise InitError(f"cannot safely read invalid JSON in {path}: {exc.msg}") from exc
+    if not isinstance(config, dict):
+        raise InitError(f"expected a JSON object in {path}")
+    if "dreaming" in config and not isinstance(config["dreaming"], bool):
+        raise InitError(f"expected dreaming to be a boolean in {path}")
+    return path, config
+
+
+def plan_dreaming_preference(
+    path: Path, config: dict, requested: Optional[bool]
+) -> Optional[Change]:
+    if requested is None or config.get("dreaming") is requested:
+        return None
+    updated = dict(config)
+    updated["dreaming"] = requested
+    content = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
+    state = "enable" if requested else "disable"
+    return Change(
+        path,
+        f"persistently {state} the dreaming skill",
+        lambda: write_text(path, content),
+    )
+
+
+def plan_dreaming_skill(repo: Path, source_root: Path) -> Optional[Change]:
+    source = source_root / "templates" / "skills" / "dreaming" / "SKILL.md"
+    if not source.is_file():
+        raise InitError(f"missing dreaming skill template: {source}")
+
+    skill_dir = validate_skills_directory(repo) / "dreaming"
+    path = skill_dir / "SKILL.md"
+    if skill_dir.is_symlink() or path.is_symlink():
+        raise InitError(f"dreaming skill must not be a symlink: {skill_dir}")
+    if skill_dir.exists() and not skill_dir.is_dir():
+        raise InitError(f"expected a directory but found a file: {skill_dir}")
+    if path.exists() and path.is_dir():
+        raise InitError(f"expected a file but found a directory: {path}")
+
+    content = read_text(source)
+    if path.exists() and read_text(path) == content:
+        return None
+    conflicts = skill_dir.exists()
+    return Change(
+        path,
+        "update the dreaming skill" if path.exists() else "install the dreaming skill",
+        lambda: write_text(path, content),
+        needs_confirmation=conflicts,
+    )
+
+
 def plan_claude(repo: Path, mode: str) -> Optional[Change]:
     path = repo / "CLAUDE.md"
     agents = repo / "AGENTS.md"
@@ -221,9 +282,11 @@ def write_text_after_unlink(path: Path, content: str) -> None:
     write_text(path, content)
 
 
-def plan_claude_skills(repo: Path, mode: str) -> Optional[Change]:
+def plan_claude_skills(
+    repo: Path, mode: str, skills_expected: bool = False
+) -> Optional[Change]:
     canonical = validate_skills_directory(repo)
-    if not canonical.exists():
+    if not canonical.exists() and not skills_expected:
         return None
     if mode == "include" or (mode == "auto" and os.name == "nt"):
         return None
@@ -275,13 +338,22 @@ def plan_claude_settings(repo: Path) -> Optional[Change]:
     )
 
 
-def collect_changes(repo: Path, source_root: Path, claude_mode: str) -> List[Change]:
+def collect_changes(
+    repo: Path,
+    source_root: Path,
+    claude_mode: str,
+    install_dreaming: bool = True,
+) -> List[Change]:
     agents_template, memory_template = load_templates(source_root)
+    dreaming_change = (
+        plan_dreaming_skill(repo, source_root) if install_dreaming else None
+    )
     candidates = [
         plan_agents(repo, agents_template),
         plan_memory_index(repo, memory_template),
         plan_claude(repo, claude_mode),
-        plan_claude_skills(repo, claude_mode),
+        dreaming_change,
+        plan_claude_skills(repo, claude_mode, skills_expected=install_dreaming),
         plan_claude_settings(repo),
     ]
     return [change for change in candidates if change is not None]
@@ -305,6 +377,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("path", nargs="?", default=".", help="path inside the target Git repository")
     parser.add_argument("-y", "--yes", action="store_true", help="approve changes to conflicting files")
     parser.add_argument("--dry-run", action="store_true", help="show changes without applying them")
+    dreaming = parser.add_mutually_exclusive_group()
+    dreaming.add_argument(
+        "--dreaming",
+        action="store_true",
+        help="install or update the dreaming skill and persistently enable it",
+    )
+    dreaming.add_argument(
+        "--no-dreaming",
+        action="store_true",
+        help="skip the dreaming skill and persistently disable it",
+    )
     parser.add_argument(
         "--claude-mode",
         choices=("auto", "symlink", "include"),
@@ -319,7 +402,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         repo = find_repo_root(Path(args.path))
         source_root = Path(__file__).resolve().parents[1]
-        changes = collect_changes(repo, source_root, args.claude_mode)
+        preference_change = None
+        if repo == source_root:
+            install_dreaming = False
+        else:
+            config_path, config = load_agent_memory_config(repo)
+            requested = True if args.dreaming else False if args.no_dreaming else None
+            install_dreaming = (
+                requested if requested is not None else config.get("dreaming", True)
+            )
+            preference_change = plan_dreaming_preference(
+                config_path, config, requested
+            )
+        changes = collect_changes(
+            repo,
+            source_root,
+            args.claude_mode,
+            install_dreaming=install_dreaming,
+        )
+        if preference_change is not None:
+            changes.insert(0, preference_change)
         print(f"Repository: {repo}")
         if not changes:
             print("Already configured; no changes needed.")
