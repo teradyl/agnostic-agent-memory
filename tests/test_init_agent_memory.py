@@ -73,7 +73,7 @@ class InitAgentMemoryTests(unittest.TestCase):
         result = self.run_cli(repo)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_initializer_runs_as_a_standalone_file(self):
+    def test_copied_initializer_requires_its_canonical_sources(self):
         repo = self.make_repo()
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -81,6 +81,22 @@ class InitAgentMemoryTests(unittest.TestCase):
         shutil.copy2(SCRIPT, standalone)
         result = subprocess.run(
             [sys.executable, str(standalone), str(repo)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must run from an agnostic-agent-memory checkout", result.stderr)
+        self.assertFalse((repo / "AGENTS.md").exists())
+
+    @unittest.skipIf(os.name == "nt", "symlink creation needs elevated Windows privileges")
+    def test_initializer_runs_through_a_symlink(self):
+        repo = self.make_repo()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        command = Path(temporary.name) / "init-agent-memory"
+        command.symlink_to(SCRIPT)
+        result = subprocess.run(
+            [sys.executable, str(command), str(repo)],
             capture_output=True,
             text=True,
         )
