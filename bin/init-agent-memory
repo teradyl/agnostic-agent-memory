@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""Initialize repository-local memory instructions for coding agents."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Sequence
+
+
+START_MARKER = "<!-- agent-memory:start -->"
+END_MARKER = "<!-- agent-memory:end -->"
+MEMORY_START_MARKER = "<!-- agent-memory:readme:start -->"
+MEMORY_END_MARKER = "<!-- agent-memory:readme:end -->"
+
+
+class InitError(Exception):
+    pass
+
+
+@dataclass
+class Change:
+    path: Path
+    summary: str
+    apply: Callable[[], None]
+    needs_confirmation: bool = False
+
+
+def find_repo_root(start: Path) -> Path:
+    candidate = start.expanduser().resolve()
+    if candidate.is_file():
+        candidate = candidate.parent
+    result = subprocess.run(
+        ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        raise InitError(f"not inside a Git repository: {candidate}")
+    return Path(result.stdout.strip()).resolve()
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise InitError(f"cannot read {path} as UTF-8") from exc
+
+
+def write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as output:
+        output.write(content)
+
+
+def replace_with_symlink(path: Path, target: str) -> None:
+    if path.is_symlink() or path.exists():
+        path.unlink()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.symlink_to(target)
+
+
+def managed_section(template: str, start_marker: str, end_marker: str, label: str) -> str:
+    start = template.find(start_marker)
+    end = template.find(end_marker)
+    if start < 0 or end < start:
+        raise InitError(f"the {label} template has invalid managed markers")
+    return template[start : end + len(end_marker)]
+
+
+def managed_template(source: str, start_marker: str, end_marker: str, label: str) -> str:
+    section = managed_section(source, start_marker, end_marker, label)
+    preamble = source[: source.index(start_marker)].rstrip()
+    return f"{preamble}\n\n{section}\n"
+
+
+def load_templates(source_root: Path) -> tuple[str, str]:
+    agents_source = source_root / "AGENTS.md"
+    memory_source = source_root / "AgentMemories" / "README.md"
+    if not agents_source.is_file() or not memory_source.is_file():
+        raise InitError(
+            "initializer must run from an agnostic-agent-memory checkout or a symlink to one"
+        )
+    agents_template = managed_template(
+        read_text(agents_source), START_MARKER, END_MARKER, "AGENTS.md"
+    )
+    memory_template = managed_template(
+        read_text(memory_source),
+        MEMORY_START_MARKER,
+        MEMORY_END_MARKER,
+        "AgentMemories/README.md",
+    )
+    return agents_template, memory_template
+
+
+def update_managed_section(
+    existing: str,
+    section: str,
+    start_marker: str,
+    end_marker: str,
+    label: str,
+) -> Optional[str]:
+    start_count = existing.count(start_marker)
+    end_count = existing.count(end_marker)
+    if start_count != end_count or start_count > 1:
+        raise InitError(f"{label} has malformed or duplicate managed markers")
+    if start_count == 0:
+        return existing.rstrip() + "\n\n" + section + "\n"
+    start = existing.index(start_marker)
+    end = existing.index(end_marker, start) + len(end_marker)
+    if existing[start:end] == section:
+        return None
+    return existing[:start] + section + existing[end:]
+
+
+def plan_agents(repo: Path, template: str) -> Optional[Change]:
+    path = repo / "AGENTS.md"
+    if path.is_symlink():
+        raise InitError(f"refusing to modify symlinked instructions: {path}")
+    if not path.exists():
+        return Change(path, "create shared agent instructions", lambda: write_text(path, template))
+    if path.is_dir():
+        raise InitError(f"expected a file but found a directory: {path}")
+    section = managed_section(template, START_MARKER, END_MARKER, "AGENTS.md")
+    updated = update_managed_section(
+        read_text(path), section, START_MARKER, END_MARKER, "AGENTS.md"
+    )
+    if updated is None:
+        return None
+    return Change(
+        path,
+        "append or update the managed project-memory section",
+        lambda: write_text(path, updated),
+        needs_confirmation=True,
+    )
+
+
+def plan_memory_index(repo: Path, template: str) -> Optional[Change]:
+    memory_dir = repo / "AgentMemories"
+    path = memory_dir / "README.md"
+    if memory_dir.is_symlink():
+        raise InitError(f"project memory directory must not be a symlink: {memory_dir}")
+    if path.exists() or path.is_symlink():
+        if path.is_symlink():
+            raise InitError(f"project memory index must not be a symlink: {path}")
+        if path.is_dir():
+            raise InitError(f"expected a file but found a directory: {path}")
+        section = managed_section(
+            template,
+            MEMORY_START_MARKER,
+            MEMORY_END_MARKER,
+            "AgentMemories/README.md",
+        )
+        updated = update_managed_section(
+            read_text(path),
+            section,
+            MEMORY_START_MARKER,
+            MEMORY_END_MARKER,
+            "AgentMemories/README.md",
+        )
+        if updated is None:
+            return None
+        return Change(
+            path,
+            "append or update the managed memory-policy section",
+            lambda: write_text(path, updated),
+            needs_confirmation=True,
+        )
+    return Change(path, "create the project-memory index", lambda: write_text(path, template))
+
+
+def validate_skills_directory(repo: Path) -> Path:
+    agents_dir = repo / ".agents"
+    skills_dir = agents_dir / "skills"
+    if agents_dir.is_symlink() or skills_dir.is_symlink():
+        raise InitError(f"project skills directory must not be a symlink: {skills_dir}")
+    if skills_dir.exists() and not skills_dir.is_dir():
+        raise InitError(f"expected a directory but found a file: {skills_dir}")
+    return skills_dir
+
+
+def load_agent_memory_config(repo: Path) -> tuple[Path, dict]:
+    path = validate_skills_directory(repo).parent / "agnostic-agent-memory.json"
+    if path.is_symlink():
+        raise InitError(f"agent memory configuration must not be a symlink: {path}")
+    if path.exists() and path.is_dir():
+        raise InitError(f"expected a file but found a directory: {path}")
+    if not path.exists():
+        return path, {}
+    try:
+        config = json.loads(read_text(path))
+    except json.JSONDecodeError as exc:
+        raise InitError(f"cannot safely read invalid JSON in {path}: {exc.msg}") from exc
+    if not isinstance(config, dict):
+        raise InitError(f"expected a JSON object in {path}")
+    if "dreaming" in config and not isinstance(config["dreaming"], bool):
+        raise InitError(f"expected dreaming to be a boolean in {path}")
+    return path, config
+
+
+def plan_dreaming_preference(
+    path: Path, config: dict, requested: Optional[bool]
+) -> Optional[Change]:
+    if requested is None or config.get("dreaming") is requested:
+        return None
+    updated = dict(config)
+    updated["dreaming"] = requested
+    content = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
+    state = "enable" if requested else "disable"
+    return Change(
+        path,
+        f"persistently {state} the dreaming skill",
+        lambda: write_text(path, content),
+    )
+
+
+def plan_dreaming_skill(repo: Path, source_root: Path) -> Optional[Change]:
+    source = source_root / "templates" / "skills" / "dreaming" / "SKILL.md"
+    if not source.is_file():
+        raise InitError(f"missing dreaming skill template: {source}")
+
+    skill_dir = validate_skills_directory(repo) / "dreaming"
+    path = skill_dir / "SKILL.md"
+    if skill_dir.is_symlink() or path.is_symlink():
+        raise InitError(f"dreaming skill must not be a symlink: {skill_dir}")
+    if skill_dir.exists() and not skill_dir.is_dir():
+        raise InitError(f"expected a directory but found a file: {skill_dir}")
+    if path.exists() and path.is_dir():
+        raise InitError(f"expected a file but found a directory: {path}")
+
+    content = read_text(source)
+    if path.exists() and read_text(path) == content:
+        return None
+    conflicts = skill_dir.exists()
+    return Change(
+        path,
+        "update the dreaming skill" if path.exists() else "install the dreaming skill",
+        lambda: write_text(path, content),
+        needs_confirmation=conflicts,
+    )
+
+
+def plan_claude(repo: Path, mode: str) -> Optional[Change]:
+    path = repo / "CLAUDE.md"
+    agents = repo / "AGENTS.md"
+    use_symlink = mode == "symlink" or (mode == "auto" and os.name != "nt")
+
+    if path.exists() and path.is_dir() and not path.is_symlink():
+        raise InitError(f"expected a file or symlink but found a directory: {path}")
+
+    if use_symlink:
+        if path.is_symlink() and path.resolve() == agents.resolve():
+            return None
+        conflicts = path.exists() or path.is_symlink()
+        return Change(
+            path,
+            "replace with a relative symlink to AGENTS.md" if conflicts else "create a relative symlink to AGENTS.md",
+            lambda: replace_with_symlink(path, "AGENTS.md"),
+            needs_confirmation=conflicts,
+        )
+
+    include = "@AGENTS.md\n"
+    if path.exists() and not path.is_symlink() and read_text(path) == include:
+        return None
+    conflicts = path.exists() or path.is_symlink()
+    return Change(
+        path,
+        "replace with an @AGENTS.md include" if conflicts else "create an @AGENTS.md include",
+        lambda: write_text_after_unlink(path, include),
+        needs_confirmation=conflicts,
+    )
+
+
+def write_text_after_unlink(path: Path, content: str) -> None:
+    if path.is_symlink():
+        path.unlink()
+    write_text(path, content)
+
+
+def plan_claude_skills(
+    repo: Path, mode: str, skills_expected: bool = False
+) -> Optional[Change]:
+    canonical = validate_skills_directory(repo)
+    if not canonical.exists() and not skills_expected:
+        return None
+    if mode == "include" or (mode == "auto" and os.name == "nt"):
+        return None
+
+    path = repo / ".claude" / "skills"
+    if path.is_symlink() and path.resolve() == canonical.resolve():
+        return None
+    if path.exists() and path.is_dir() and not path.is_symlink():
+        raise InitError(f"refusing to replace existing Claude skills directory: {path}")
+    conflicts = path.exists() or path.is_symlink()
+    return Change(
+        path,
+        "replace with an alias to .agents/skills" if conflicts else "link Claude skills to .agents/skills",
+        lambda: replace_with_symlink(path, "../.agents/skills"),
+        needs_confirmation=conflicts,
+    )
+
+
+def plan_claude_settings(repo: Path) -> Optional[Change]:
+    settings_dir = repo / ".claude"
+    path = settings_dir / "settings.json"
+    if settings_dir.is_symlink():
+        raise InitError(f"Claude settings directory must not be a symlink: {settings_dir}")
+    if path.is_symlink():
+        raise InitError(f"Claude settings must not be a symlink: {path}")
+    if path.exists() and path.is_dir():
+        raise InitError(f"expected a file but found a directory: {path}")
+
+    exists = path.exists()
+    if exists:
+        try:
+            settings = json.loads(read_text(path))
+        except json.JSONDecodeError as exc:
+            raise InitError(f"cannot safely update invalid JSON in {path}: {exc.msg}") from exc
+        if not isinstance(settings, dict):
+            raise InitError(f"expected a JSON object in {path}")
+        if settings.get("autoMemoryEnabled") is False:
+            return None
+    else:
+        settings = {}
+
+    settings["autoMemoryEnabled"] = False
+    content = json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
+    return Change(
+        path,
+        "set autoMemoryEnabled to false",
+        lambda: write_text(path, content),
+        needs_confirmation=exists,
+    )
+
+
+def collect_changes(
+    repo: Path,
+    source_root: Path,
+    claude_mode: str,
+    install_dreaming: bool = True,
+) -> List[Change]:
+    agents_template, memory_template = load_templates(source_root)
+    dreaming_change = (
+        plan_dreaming_skill(repo, source_root) if install_dreaming else None
+    )
+    candidates = [
+        plan_agents(repo, agents_template),
+        plan_memory_index(repo, memory_template),
+        plan_claude(repo, claude_mode),
+        dreaming_change,
+        plan_claude_skills(repo, claude_mode, skills_expected=install_dreaming),
+        plan_claude_settings(repo),
+    ]
+    return [change for change in candidates if change is not None]
+
+
+def confirm(changes: Sequence[Change]) -> bool:
+    guarded = [change for change in changes if change.needs_confirmation]
+    if not guarded:
+        return True
+    if not sys.stdin.isatty():
+        paths = ", ".join(str(change.path) for change in guarded)
+        raise InitError(f"confirmation required to modify existing files: {paths}; rerun with --yes")
+    answer = input("Modify the existing files listed above? [y/N] ").strip().lower()
+    return answer in {"y", "yes"}
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Set up repository-local, agent-agnostic project memory."
+    )
+    parser.add_argument("path", nargs="?", default=".", help="path inside the target Git repository")
+    parser.add_argument("-y", "--yes", action="store_true", help="approve changes to conflicting files")
+    parser.add_argument("--dry-run", action="store_true", help="show changes without applying them")
+    dreaming = parser.add_mutually_exclusive_group()
+    dreaming.add_argument(
+        "--dreaming",
+        action="store_true",
+        help="install or update the dreaming skill and persistently enable it",
+    )
+    dreaming.add_argument(
+        "--no-dreaming",
+        action="store_true",
+        help="skip the dreaming skill and persistently disable it",
+    )
+    parser.add_argument(
+        "--claude-mode",
+        choices=("auto", "symlink", "include"),
+        default="auto",
+        help="use symlink-based or portable Claude compatibility (default: auto)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    try:
+        repo = find_repo_root(Path(args.path))
+        source_root = Path(__file__).resolve().parents[1]
+        preference_change = None
+        if repo == source_root:
+            install_dreaming = False
+        else:
+            config_path, config = load_agent_memory_config(repo)
+            requested = True if args.dreaming else False if args.no_dreaming else None
+            install_dreaming = (
+                requested if requested is not None else config.get("dreaming", True)
+            )
+            preference_change = plan_dreaming_preference(
+                config_path, config, requested
+            )
+        changes = collect_changes(
+            repo,
+            source_root,
+            args.claude_mode,
+            install_dreaming=install_dreaming,
+        )
+        if preference_change is not None:
+            changes.insert(0, preference_change)
+        print(f"Repository: {repo}")
+        if not changes:
+            print("Already configured; no changes needed.")
+            return 0
+        for change in changes:
+            warning = " (existing file)" if change.needs_confirmation else ""
+            print(f"  {change.summary}: {change.path.relative_to(repo)}{warning}")
+        if args.dry_run:
+            print("Dry run; no changes applied.")
+            return 0
+        if not args.yes and not confirm(changes):
+            print("Cancelled; no changes applied.")
+            return 1
+        for change in changes:
+            change.apply()
+        print(f"Initialized agent memory in {repo}")
+        return 0
+    except (InitError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
