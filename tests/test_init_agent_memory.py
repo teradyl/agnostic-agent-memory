@@ -1,0 +1,242 @@
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "bin" / "init-agent-memory"
+SPEC = importlib.util.spec_from_loader(
+    "init_agent_memory", SourceFileLoader("init_agent_memory", str(SCRIPT))
+)
+MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+
+
+class InitAgentMemoryTests(unittest.TestCase):
+    def make_repo(self, name="repo"):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        repo = Path(temporary.name) / name
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        return repo
+
+    def run_cli(self, repo, *args):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *args, str(repo)],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_new_repository_and_idempotence(self):
+        repo = self.make_repo()
+        first = self.run_cli(repo)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        if os.name == "nt":
+            self.assertEqual((repo / "CLAUDE.md").read_text(), "@AGENTS.md\n")
+        else:
+            self.assertTrue((repo / "CLAUDE.md").is_symlink())
+            self.assertEqual((repo / "CLAUDE.md").readlink(), Path("AGENTS.md"))
+        self.assertIn("only durable project-memory store", (repo / "AGENTS.md").read_text())
+        self.assertIn(
+            "Where durable knowledge belongs",
+            (repo / "AgentMemories" / "README.md").read_text(),
+        )
+        self.assertIn(
+            MODULE.MEMORY_START_MARKER,
+            (repo / "AgentMemories" / "README.md").read_text(),
+        )
+        self.assertIn(
+            "follow the knowledge-placement order",
+            (repo / "AGENTS.md").read_text(),
+        )
+        self.assertFalse((repo / ".agents").exists())
+        self.assertFalse((repo / ".claude" / "skills").exists())
+        self.assertEqual(
+            json.loads((repo / ".claude" / "settings.json").read_text()),
+            {"autoMemoryEnabled": False},
+        )
+        second = self.run_cli(repo)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("no changes needed", second.stdout)
+
+    def test_path_with_spaces(self):
+        repo = self.make_repo("repo with spaces")
+        result = self.run_cli(repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_initializer_runs_as_a_standalone_file(self):
+        repo = self.make_repo()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        standalone = Path(temporary.name) / "init-agent-memory"
+        shutil.copy2(SCRIPT, standalone)
+        result = subprocess.run(
+            [sys.executable, str(standalone), str(repo)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((repo / "AGENTS.md").is_file())
+
+    def test_existing_agents_requires_confirmation(self):
+        repo = self.make_repo()
+        original = "# Existing instructions\n\nKeep this.\n"
+        (repo / "AGENTS.md").write_text(original)
+        result = self.run_cli(repo)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual((repo / "AGENTS.md").read_text(), original)
+        self.assertFalse((repo / "AgentMemories").exists())
+
+    def test_yes_appends_without_replacing_existing_agents(self):
+        repo = self.make_repo()
+        (repo / "AGENTS.md").write_text("# Existing instructions\n\nKeep this.\n")
+        result = self.run_cli(repo, "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = (repo / "AGENTS.md").read_text()
+        self.assertTrue(content.startswith("# Existing instructions\n\nKeep this.\n"))
+        self.assertEqual(content.count(MODULE.START_MARKER), 1)
+
+    def test_existing_memory_index_requires_confirmation(self):
+        repo = self.make_repo()
+        memory = repo / "AgentMemories" / "README.md"
+        memory.parent.mkdir()
+        memory.write_text("# Existing memory index\n\n- Keep this.\n")
+        result = self.run_cli(repo)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(memory.read_text(), "# Existing memory index\n\n- Keep this.\n")
+        self.assertFalse((repo / "AGENTS.md").exists())
+
+    def test_yes_appends_policy_without_replacing_existing_memory_index(self):
+        repo = self.make_repo()
+        memory = repo / "AgentMemories" / "README.md"
+        memory.parent.mkdir()
+        memory.write_text("# Existing memory index\n\n- Keep this.\n")
+        result = self.run_cli(repo, "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = memory.read_text()
+        self.assertTrue(content.startswith("# Existing memory index\n\n- Keep this.\n"))
+        self.assertEqual(content.count(MODULE.MEMORY_START_MARKER), 1)
+
+    def test_update_preserves_memory_index_entries(self):
+        repo = self.make_repo()
+        first = self.run_cli(repo)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        memory = repo / "AgentMemories" / "README.md"
+        content = memory.read_text().replace(
+            "Skills are procedures", "Skills were procedures"
+        )
+        memory.write_text(content + "\n## Index\n\n- [Decision](decision.md)\n")
+        result = self.run_cli(repo, "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = memory.read_text()
+        self.assertIn("Skills are procedures", updated)
+        self.assertNotIn("Skills were procedures", updated)
+        self.assertIn("- [Decision](decision.md)", updated)
+
+    def test_conflicting_claude_file_is_preserved_without_confirmation(self):
+        repo = self.make_repo()
+        (repo / "CLAUDE.md").write_text("Existing Claude instructions\n")
+        result = self.run_cli(repo)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual((repo / "CLAUDE.md").read_text(), "Existing Claude instructions\n")
+        self.assertFalse((repo / "AGENTS.md").exists())
+
+    def test_include_mode_replaces_conflict_with_confirmation(self):
+        repo = self.make_repo()
+        (repo / "CLAUDE.md").write_text("Existing\n")
+        result = self.run_cli(repo, "--yes", "--claude-mode", "include")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((repo / "CLAUDE.md").is_symlink())
+        self.assertEqual((repo / "CLAUDE.md").read_text(), "@AGENTS.md\n")
+        self.assertFalse((repo / ".claude" / "skills").exists())
+
+    @unittest.skipIf(os.name == "nt", "symlink creation needs elevated Windows privileges")
+    def test_existing_project_skills_are_linked_for_claude(self):
+        repo = self.make_repo()
+        skill = repo / ".agents" / "skills" / "example" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("---\nname: example\ndescription: Example skill.\n---\n")
+        result = self.run_cli(repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((repo / ".claude" / "skills").readlink(), Path("../.agents/skills"))
+
+    def test_existing_claude_settings_are_merged(self):
+        repo = self.make_repo()
+        settings = repo / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text('{"permissions": {"allow": ["Read"]}}\n')
+        result = self.run_cli(repo, "--yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = json.loads(settings.read_text())
+        self.assertEqual(updated["permissions"], {"allow": ["Read"]})
+        self.assertIs(updated["autoMemoryEnabled"], False)
+
+    def test_invalid_claude_settings_abort_before_writes(self):
+        repo = self.make_repo()
+        settings = repo / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text("not json\n")
+        result = self.run_cli(repo, "--yes")
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((repo / "AGENTS.md").exists())
+
+    def test_dry_run_does_not_write(self):
+        repo = self.make_repo()
+        result = self.run_cli(repo, "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Dry run", result.stdout)
+        self.assertFalse((repo / "AGENTS.md").exists())
+
+    @unittest.skipIf(os.name == "nt", "symlink creation needs elevated Windows privileges")
+    def test_external_memory_directory_symlink_is_rejected(self):
+        repo = self.make_repo()
+        external = repo.parent / "external-memory"
+        external.mkdir()
+        (repo / "AgentMemories").symlink_to(external, target_is_directory=True)
+        result = self.run_cli(repo, "--yes")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must not be a symlink", result.stderr)
+        self.assertFalse((external / "README.md").exists())
+
+    @unittest.skipIf(os.name == "nt", "symlink creation needs elevated Windows privileges")
+    def test_external_skills_directory_symlink_is_rejected(self):
+        repo = self.make_repo()
+        external = repo.parent / "external-skills"
+        external.mkdir()
+        (repo / ".agents").symlink_to(external, target_is_directory=True)
+        result = self.run_cli(repo, "--yes")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("project skills directory must not be a symlink", result.stderr)
+        self.assertFalse((external / "skills" / "README.md").exists())
+
+    @unittest.skipIf(os.name == "nt", "symlink creation needs elevated Windows privileges")
+    def test_symlinked_agents_file_is_rejected(self):
+        repo = self.make_repo()
+        external = repo.parent / "external-agents.md"
+        external.write_text("# External\n")
+        (repo / "AGENTS.md").symlink_to(external)
+        result = self.run_cli(repo, "--yes")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("refusing to modify symlinked instructions", result.stderr)
+        self.assertEqual(external.read_text(), "# External\n")
+
+    @unittest.skipIf(os.name == "nt", "symlink creation needs elevated Windows privileges")
+    def test_dangling_agents_symlink_is_rejected(self):
+        repo = self.make_repo()
+        (repo / "AGENTS.md").symlink_to(repo.parent / "missing-agents.md")
+        result = self.run_cli(repo, "--yes")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("refusing to modify symlinked instructions", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
