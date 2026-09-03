@@ -1,6 +1,7 @@
 # Architecture
 
 - `AGENTS.md` and `AgentMemories/README.md` are the canonical policy sources. `bin/init-agent-memory` reads their managed sections instead of copying policy text into the script or README.
+- Each policy statement lives in exactly one file: `AGENTS.md` carries the directives an agent always loads, and `AgentMemories/README.md` carries the knowledge-placement detail those directives point to. Extend the file that already owns a topic rather than restating it in the other.
 - Managed markers let later initializer versions update their policy sections in `AGENTS.md` and `AgentMemories/README.md` while preserving unrelated instructions and the repository's memory index.
 - The initializer must run from a checkout, directly or through a resolving symlink, so its canonical policy sources remain available.
 - `.agents/skills/` is the canonical location for actual repository skills. Do not add placeholder files solely to preserve an empty directory.
