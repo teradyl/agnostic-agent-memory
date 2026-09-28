@@ -34,7 +34,7 @@ Follow the knowledge-placement order in `AgentMemories/README.md`. Update an exi
 - Make high-confidence, repository-local improvements directly.
 - Create or update scripts for deterministic operations and skills for reusable agent procedures, following the repository's skill conventions.
 - Keep memories concise and synthesized. Update or remove stale statements rather than appending corrections.
-- Consolidate overlapping memories into one document instead of adding another, and keep `AgentMemories/README.md` accurate when files change.
+- Keep the `AgentMemories/README.md` index accurate when memory files are merged, renamed, or removed.
 - Ask before deleting uncertain context, changing product behavior, or expanding beyond reflection and workflow maintenance.
 - Validate every changed script or skill with the most relevant available checks.
 
