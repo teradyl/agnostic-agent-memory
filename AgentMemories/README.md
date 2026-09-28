@@ -14,6 +14,8 @@ Use the first location that fits. Do not duplicate the same knowledge across lay
 3. Encode a repeatable operation in a script or task. Add a skill when an agent needs reusable instructions for when or how to perform it.
 4. Store durable decisions, rationale, constraints, pitfalls, or cross-cutting context in `AgentMemories/` when they do not fit naturally anywhere above.
 
+Within `AgentMemories/`, update the memory that already covers the topic. Add a file only when no existing memory fits, and index it in this file.
+
 Skills are procedures, not a general memory store. Do not create a skill only to preserve a project fact.
 <!-- agent-memory:readme:end -->
 
